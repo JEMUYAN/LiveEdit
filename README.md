@@ -18,10 +18,10 @@ Xinyu Wang<sup>1</sup>, Chongbo Zhao<sup>1</sup>, Fangneng Zhan<sup>2</sup>, Yue
 </div>
 
 
-## 📣 Updates
-
-- **[2026.06.24]** Release README, inference scripts, and Hugging Face checkpoint instructions.
-- **[2026.06.24]** Release inference and training code.
+## 📣 News
+- **[2026.08.04]** 💡💡 Our recent work, **[LiveLight](https://github.com/mayuelala/LiveLight)**, has been accepted to **TOG 2026**. LiveLight focuses on real-time streaming video relighting with interactive control.
+- **[2026.06.24]** We released the inference and training code for LiveEdit, along with instructions for downloading and using the checkpoints on Hugging Face.
+- **[2026.06.24]** ⚡️⚡️ Our work, **[LiveEdit](https://github.com/cp-cp/LiveEdit)**, has been accepted to **ECCV 2026**. LiveEdit is a diffusion-based framework for real-time streaming video editing.
 
 ## 🔍 Overview
 
