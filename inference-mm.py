@@ -80,6 +80,8 @@ parser.add_argument("--return_generation_time", action="store_true", help="Wheth
 parser.add_argument("--profile", action="store_true", help="Enable profiling")
 parser.add_argument("--local_attn_size", type=int, default=-1, help="Local attention size for causal attention")
 parser.add_argument("--sink_size", type=int, default=0, help="Sink size for causal attention")
+parser.add_argument("--window_rope", action="store_true",
+                    help="Rebase Q/K RoPE positions to the current rolling KV window")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -130,11 +132,19 @@ if args.enable_tinyvae:
 # Initialize pipeline
 if hasattr(config, 'denoising_step_list'):
     # Few-step inference
-    pipeline = CausalInferencePipeline(config, device=device, local_attn_size=local_attn_size, sink_size=sink_size, expand_patch_embedding=True, vae=vae)
+    pipeline = CausalInferencePipeline(
+        config, device=device, local_attn_size=local_attn_size,
+        sink_size=sink_size, window_rope=args.window_rope,
+        expand_patch_embedding=True, vae=vae
+    )
 else:
     # Multi-step diffusion inference
     # pipeline = CausalDiffusionInferencePipeline(config, device=device, expand_patch_embedding=True)
-    pipeline = CausalInferencePipeline(config, device=device, local_attn_size=local_attn_size, sink_size=sink_size, expand_patch_embedding=True)
+    pipeline = CausalInferencePipeline(
+        config, device=device, local_attn_size=local_attn_size,
+        sink_size=sink_size, window_rope=args.window_rope,
+        expand_patch_embedding=True
+    )
 
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")

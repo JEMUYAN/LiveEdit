@@ -1,0 +1,6 @@
+[
+  {
+    "instruction": "Change the white coat to black.",
+    "source_path": "./test_cases/long_test.mp4"
+  }
+]

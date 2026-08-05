@@ -18,11 +18,20 @@ import math
 import torch.distributed as dist
 import os
 
+from utils.attention_mask import blockwise_causal_attention_mask
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
+flex_attention_compile_mode = os.environ.get(
+    "FLEX_ATTENTION_COMPILE_MODE", "max-autotune-no-cudagraphs")
+if flex_attention_compile_mode not in {"default", "max-autotune-no-cudagraphs"}:
+    raise ValueError(
+        "FLEX_ATTENTION_COMPILE_MODE must be 'default' or "
+        "'max-autotune-no-cudagraphs', got "
+        f"{flex_attention_compile_mode!r}")
 flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+    flex_attention, dynamic=False, mode=flex_attention_compile_mode)
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
@@ -121,6 +130,7 @@ class CausalWanSelfAttention(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 window_rope=False,
                  qk_norm=True,
                  eps=1e-6,
                  block_id=None):
@@ -131,6 +141,7 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.window_rope = window_rope
         self.qk_norm = qk_norm
         self.eps = eps
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
@@ -268,28 +279,43 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
-            
-            # 🎯 根据pruning_info选择RoPE函数（kv_cache分支）
-            if pruning_info and pruning_info.get('pruned', False):
-                roped_query = causal_rope_apply_pruned(
-                    q, grid_sizes, freqs, pruning_info,
-                    start_frame=current_start_frame
-                ).type_as(v)
-                roped_key = causal_rope_apply_pruned(
-                    k, grid_sizes, freqs, pruning_info,
-                    start_frame=current_start_frame
-                ).type_as(v)
-            else:
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            is_pruned = pruning_info and pruning_info.get('pruned', False)
+            if self.window_rope and is_pruned:
+                raise NotImplementedError(
+                    "window_rope is not compatible with pruned KV tokens yet"
+                )
 
-            current_end = current_start + roped_query.shape[1]
+            # Absolute RoPE stores already-rotated K. Window RoPE instead stores
+            # raw K, because rolling changes its physical/window position and K
+            # must be rotated again in the new window coordinate system.
+            if not self.window_rope:
+                if is_pruned:
+                    roped_query = causal_rope_apply_pruned(
+                        q, grid_sizes, freqs, pruning_info,
+                        start_frame=current_start_frame
+                    ).type_as(v)
+                    cache_key = causal_rope_apply_pruned(
+                        k, grid_sizes, freqs, pruning_info,
+                        start_frame=current_start_frame
+                    ).type_as(v)
+                else:
+                    roped_query = causal_rope_apply(
+                        q, grid_sizes, freqs,
+                        start_frame=current_start_frame
+                    ).type_as(v)
+                    cache_key = causal_rope_apply(
+                        k, grid_sizes, freqs,
+                        start_frame=current_start_frame
+                    ).type_as(v)
+            else:
+                roped_query = None
+                cache_key = k
+
+            current_end = current_start + q.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
+            num_new_tokens = q.shape[1]
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
@@ -309,7 +335,7 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"[KVCache DEBUG] {local_start_index} to {local_end_index}, {sink_tokens=}")
                 #     print(f"[KVCache DEBUG] {roped_key.shape=}")
                 #     print(f"[KVCache DEBUG] {v.shape=}")
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache["k"][:, local_start_index:local_end_index] = cache_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
             else:
                 # Assign new keys/values directly up to current_end
@@ -319,14 +345,63 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"[KVCache DEBUG] {local_start_index} to {local_end_index}, {sink_tokens=}")
                 #     print(f"[KVCache DEBUG] {roped_key.shape=}")
                 #     print(f"[KVCache DEBUG] {v.shape=}")
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache["k"][:, local_start_index:local_end_index] = cache_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            # print(f"{max(0, local_end_index - self.max_attention_size)} to {local_end_index}")
-            # 
+            # The physical training cache may be larger than the logical local
+            # attention window so gradient checkpointing can replay chunks in
+            # reverse. Select only the logical view here: persistent sink
+            # frames plus the most recent non-sink frames.
+            if self.local_attn_size == -1:
+                attention_start = max(0, local_end_index - self.max_attention_size)
+                attention_k = kv_cache["k"][:, attention_start:local_end_index]
+                attention_v = kv_cache["v"][:, attention_start:local_end_index]
+            else:
+                logical_cache_tokens = self.local_attn_size * frame_seqlen
+                recent_tokens = logical_cache_tokens - sink_tokens
+                if local_end_index <= logical_cache_tokens:
+                    attention_k = kv_cache["k"][:, :local_end_index]
+                    attention_v = kv_cache["v"][:, :local_end_index]
+                elif sink_tokens == 0:
+                    attention_k = kv_cache["k"][:, local_end_index - recent_tokens:local_end_index]
+                    attention_v = kv_cache["v"][:, local_end_index - recent_tokens:local_end_index]
+                else:
+                    attention_k = torch.cat([
+                        kv_cache["k"][:, :sink_tokens],
+                        kv_cache["k"][:, local_end_index - recent_tokens:local_end_index]
+                    ], dim=1)
+                    attention_v = torch.cat([
+                        kv_cache["v"][:, :sink_tokens],
+                        kv_cache["v"][:, local_end_index - recent_tokens:local_end_index]
+                    ], dim=1)
+
+            if self.window_rope:
+                if attention_k.shape[1] % frame_seqlen != 0:
+                    raise ValueError(
+                        "window_rope requires a whole number of frames in KV cache, "
+                        f"got {attention_k.shape[1]} tokens for frame_seqlen={frame_seqlen}"
+                    )
+                key_grid_sizes = grid_sizes.clone()
+                key_grid_sizes[:, 0] = attention_k.shape[1] // frame_seqlen
+                attention_k = causal_rope_apply(
+                    attention_k,
+                    key_grid_sizes,
+                    freqs,
+                    start_frame=0,
+                ).type_as(v)
+                query_window_start = (
+                    attention_k.shape[1] - q.shape[1]
+                ) // frame_seqlen
+                roped_query = causal_rope_apply(
+                    q,
+                    grid_sizes,
+                    freqs,
+                    start_frame=query_window_start,
+                ).type_as(v)
+
             x = attention( # 对应wan/modules/attention.py中的attention函数
                 roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                attention_k,
+                attention_v,
                 debug_dict=debug_dict
             )
             kv_cache["global_end_index"].fill_(current_end)
@@ -347,6 +422,7 @@ class CausalWanAttentionBlock(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 window_rope=False,
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6,
@@ -362,7 +438,10 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps, block_id)
+        self.self_attn = CausalWanSelfAttention(
+            dim, num_heads, local_attn_size, sink_size, window_rope,
+            qk_norm, eps, block_id
+        )
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -897,6 +976,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  num_layers=32,
                  local_attn_size=-1,
                  sink_size=0,
+                 window_rope=False,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -954,6 +1034,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.window_rope = window_rope
+        if local_attn_size != -1 and not 0 <= sink_size < local_attn_size:
+            raise ValueError(
+                f"sink_size must satisfy 0 <= sink_size < local_attn_size, got "
+                f"sink_size={sink_size}, local_attn_size={local_attn_size}"
+            )
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
@@ -974,8 +1061,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
-            CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps, block_id)
+            CausalWanAttentionBlock(
+                cross_attn_type, dim, ffn_dim, num_heads,
+                local_attn_size, sink_size, window_rope,
+                qk_norm, cross_attn_norm, eps, block_id
+            )
             for block_id in range(num_layers)
         ])
 
@@ -1108,7 +1198,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
         device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1
+        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1,
+        sink_size=0
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -1136,10 +1227,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 frame_seqlen * num_frame_per_block
 
         def attention_mask(b, h, q_idx, kv_idx):
-            if local_attn_size == -1:
-                return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
-            else:
-                return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (q_idx == kv_idx)
+            return blockwise_causal_attention_mask(
+                q_idx,
+                kv_idx,
+                ends,
+                frame_seqlen,
+                local_attn_size,
+                sink_size,
+            )
             # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
@@ -1254,7 +1349,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _prepare_blockwise_causal_attn_mask_i2v(
         device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=4, local_attn_size=-1
+        frame_seqlen: int = 1560, num_frame_per_block=4, local_attn_size=-1,
+        sink_size=0
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -1286,11 +1382,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 frame_seqlen * num_frame_per_block
 
         def attention_mask(b, h, q_idx, kv_idx):
-            if local_attn_size == -1:
-                return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
-            else:
-                return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | \
-                    (q_idx == kv_idx)
+            return blockwise_causal_attention_mask(
+                q_idx,
+                kv_idx,
+                ends,
+                frame_seqlen,
+                local_attn_size,
+                sink_size,
+            )
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
                                        KV_LEN=total_length + padded_length, _compile=False, device=device)
@@ -1603,14 +1702,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         device, num_frames=x.shape[2],
                         frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
                         num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
+                        local_attn_size=self.local_attn_size,
+                        sink_size=self.sink_size
                     )
                 else:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask(
                         device, num_frames=x.shape[2],
                         frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
                         num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
+                        local_attn_size=self.local_attn_size,
+                        sink_size=self.sink_size
                     )
 
         if y is not None:  # channel-wise

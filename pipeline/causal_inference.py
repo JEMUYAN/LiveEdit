@@ -17,30 +17,43 @@ class CausalInferencePipeline(torch.nn.Module):
             vae=None,
             local_attn_size=-1,
             sink_size=0,
+            window_rope=None,
             expand_patch_embedding=False
     ):
         super().__init__()
         self.device = device
+        model_kwargs = dict(getattr(args, "model_kwargs", {}))
+        model_kwargs.update(
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+        )
+        if window_rope is not None:
+            model_kwargs["window_rope"] = window_rope
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True, local_attn_size=local_attn_size, sink_size=sink_size) if generator is None else generator
+            **model_kwargs, is_causal=True
+        ) if generator is None else generator
         if expand_patch_embedding:
             self._expand_input_layer(args)
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
-        # self.scheduler = self.generator.get_scheduler()
-        # self.denoising_step_list = torch.tensor(
-        #     args.denoising_step_list, dtype=torch.long)
-        # if args.warp_denoising_step:
-        #     timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
-        #     self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
-
         self.scheduler = self.generator.get_scheduler()
-        if hasattr(args, "denoising_step_list"):    
-            N = len(args.denoising_step_list)  # 你想跑多少步就多少
+        if hasattr(args, "denoising_step_list"):
             self.denoising_step_list = torch.tensor(
-             args.denoising_step_list, dtype=torch.long)
+                args.denoising_step_list, dtype=torch.long
+            )
+            if getattr(args, "warp_denoising_step", False):
+                # Match the training-time conversion in model/base.py exactly.
+                # With shift=5, [1000, 750, 500, 250] becomes
+                # [1000.0, 937.5, 833.3333, 625.0].
+                scheduler_timesteps = torch.cat((
+                    self.scheduler.timesteps.cpu(),
+                    torch.tensor([0], dtype=torch.float32)
+                ))
+                self.denoising_step_list = scheduler_timesteps[
+                    1000 - self.denoising_step_list
+                ]
         else:
             if hasattr(args, "inference_num_steps"):
                 N = args.inference_num_steps
