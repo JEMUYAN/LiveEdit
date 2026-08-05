@@ -19,6 +19,7 @@ Xinyu Wang<sup>1</sup>, Chongbo Zhao<sup>1</sup>, Fangneng Zhan<sup>2</sup>, Yue
 
 
 ## 📣 News
+- **[2026.08.05]** Added long-video inference with rolling attention sinks and window-relative RoPE.
 - **[2026.08.04]** 💡💡 Our recent work, **[LiveLight](https://github.com/mayuelala/LiveLight)**, has been accepted to **TOG 2026**. LiveLight focuses on real-time streaming video relighting with interactive control.
 - **[2026.06.24]** We released the inference and training code for LiveEdit, along with instructions for downloading and using the checkpoints on Hugging Face.
 - **[2026.06.24]** ⚡️⚡️ Our work, **[LiveEdit](https://github.com/cp-cp/LiveEdit)**, has been accepted to **ECCV 2026**. LiveEdit is a diffusion-based framework for real-time streaming video editing.
@@ -37,6 +38,7 @@ LiveEdit is a diffusion-based framework for streaming video editing. Given a sou
 - Strong source preservation for backgrounds and non-edited regions.
 - Three-stage distillation from a bidirectional editing teacher to a streaming student.
 - AR-oriented Mask Cache for efficient region-aware computation reuse.
+- Long-video inference with rolling attention sinks and window-relative RoPE.
 - Built on Wan2.1 and the Self-Forcing codebase.
 
 ## 🛠 Getting Started
@@ -96,7 +98,7 @@ For video-to-video editing, prepare a JSON file with source videos and text inst
 ]
 ```
 
-Example inputs are provided in `test_cases/test.json` and `test_cases/test-long.json`.
+Example inputs are provided in `test_cases/test.json` and `test_cases/long_test.json`.
 
 ### 4. Inference
 
@@ -118,6 +120,18 @@ CUDA_VISIBLE_DEVICES=0 python inference-mm.py \
   --task v2v \
   --inference_num_steps 50
 ```
+
+### 5. Long-video inference
+
+Generate longer videos using a rolling local-attention window:
+
+```bash
+bash infer-local-ar-forcing-long.sh
+```
+
+By default, the script uses a 12-frame attention window consisting of 3 persistent sink frames and the 9 most recent frames. Window-relative RoPE rebases positional embeddings as the KV cache rolls.
+
+`SINK_SIZE` must be smaller than `LOCAL_ATTN_SIZE`. Since the released checkpoint was trained on shorter sequences, visual quality may degrade when extrapolating far beyond its training horizon.
 
 ## 🚀 Efficient Inference with AR-Oriented Mask Cache
 
