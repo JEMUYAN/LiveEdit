@@ -38,22 +38,18 @@ class CausalInferencePipeline(torch.nn.Module):
         self.vae = WanVAEWrapper() if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
+        # self.scheduler = self.generator.get_scheduler()
+        # self.denoising_step_list = torch.tensor(
+        #     args.denoising_step_list, dtype=torch.long)
+        # if args.warp_denoising_step:
+        #     timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
+        #     self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
+
         self.scheduler = self.generator.get_scheduler()
-        if hasattr(args, "denoising_step_list"):
+        if hasattr(args, "denoising_step_list"):    
+            N = len(args.denoising_step_list)  # 你想跑多少步就多少
             self.denoising_step_list = torch.tensor(
-                args.denoising_step_list, dtype=torch.long
-            )
-            if getattr(args, "warp_denoising_step", False):
-                # Match the training-time conversion in model/base.py exactly.
-                # With shift=5, [1000, 750, 500, 250] becomes
-                # [1000.0, 937.5, 833.3333, 625.0].
-                scheduler_timesteps = torch.cat((
-                    self.scheduler.timesteps.cpu(),
-                    torch.tensor([0], dtype=torch.float32)
-                ))
-                self.denoising_step_list = scheduler_timesteps[
-                    1000 - self.denoising_step_list
-                ]
+             args.denoising_step_list, dtype=torch.long)
         else:
             if hasattr(args, "inference_num_steps"):
                 N = args.inference_num_steps

@@ -5,7 +5,7 @@
 CKPT_PATH="checkpoints/liveedit/ar-forcing_002000.pt"
 
 # 12-frame logical window = 3 persistent sink frames + 9 most recent frames.
-LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-12}"
+LOCAL_ATTN_SIZE="${LOCAL_ATTN_SIZE:-9}"
 SINK_SIZE="${SINK_SIZE:-3}"
 
 CUDA_VISIBLE_DEVICES=0 python inference-mm.py \
