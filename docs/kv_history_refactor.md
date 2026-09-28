@@ -38,6 +38,20 @@ The cached path has two coordinate systems:
 The physical cache remains compatible with existing pipelines. This refactor
 only gives that dictionary a small adapter (`KVStore`).
 
+### Baseline configuration caveat
+
+The implementation treats `local_attn_size` as the total logical window:
+
+```text
+recent_size = local_attn_size - sink_size
+```
+
+`infer-local-ar-forcing-long.sh` currently comments "12-frame logical window =
+3 sink + 9 recent", but its defaults pass `local_attn_size=9` and `sink_size=3`.
+The executable code therefore produces 3 sink + 6 recent frames. Phase one
+preserves the executable behavior rather than silently changing it to match the
+comment. Any intended configuration correction should be a separate change.
+
 ## Components
 
 ### `KVStore`

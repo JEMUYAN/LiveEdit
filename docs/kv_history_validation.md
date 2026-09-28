@@ -23,6 +23,13 @@
 These checks establish source-level consistency only. They are not runtime or
 numerical-equivalence evidence.
 
+### Configuration discrepancy retained intentionally
+
+The code defines recent frames as `local_attn_size - sink_size`. The long-video
+script defaults to `local_attn_size=9`, `sink_size=3` while its comment describes
+3 sink + 9 recent frames. The refactor preserves the code's effective 3 + 6
+behavior. Do not mix a configuration correction into the equivalence test.
+
 ## Server-side focused equivalence test
 
 Run from the repository root in the existing LiveEdit environment:
