@@ -16,7 +16,9 @@
 | Git whitespace check | PASS | `git diff --check` returned no errors. |
 | Public attention signatures | UNCHANGED | Constructor and `forward()` signatures were not modified. |
 | Pipeline cache schema | UNCHANGED | Existing `k`, `v`, `global_end_index`, and `local_end_index` dictionaries remain in use. |
-| Model parameters | UNCHANGED BY DESIGN | New objects are plain Python classes, not `nn.Module` or `nn.Parameter`. Confirm on server by comparing state-dict keys. |
+| Policy boundary | PASS BY INSPECTION | `KVStore` contains storage primitives; rolling, sink retention, eviction, and logical selection live in `SinkRecentHistoryPolicy`. |
+| Baseline behavior | PASS BY INSPECTION | `NoMemoryManagementPolicy` only appends and returns all initialized KV; it raises rather than evicts at capacity. |
+| Model parameters | UNCHANGED BY DESIGN | Policy objects are plain Python classes, not `nn.Module` or `nn.Parameter`. Confirm on server by comparing state-dict keys. |
 
 These checks establish source-level consistency only. They are not runtime or
 numerical-equivalence evidence.
@@ -38,6 +40,9 @@ compares the original and refactored algorithms after every chunk with
 - selected attention K/V;
 - absolute and window-relative position mapping; and
 - scaled-dot-product attention output.
+
+The same file separately checks the no-management baseline: sequential append,
+full-history visibility, and an explicit error on capacity exhaustion.
 
 Record the result here after the server run:
 
@@ -76,7 +81,7 @@ Conclusion:
 ## Files involved
 
 - `wan/modules/causal_model.py`: delegates the cached-attention branch.
-- `wan/modules/kv_memory.py`: new parameter-free components.
+- `wan/modules/kv_memory.py`: policy-free store, policy interfaces, no-management baseline, official Sink+Recent policy, and position mapper.
 - `tests/test_kv_history_equivalence.py`: fixed-seed reference comparison.
 - `docs/kv_history_refactor.md`: design and invariants.
 - `docs/kv_history_validation.md`: validation status and server record.

@@ -30,54 +30,70 @@ class SelectedKV:
 
 
 class KVStore:
-    """Thin adapter over LiveEdit's existing per-layer cache dictionary."""
+    """Policy-free adapter over LiveEdit's per-layer cache dictionary."""
 
     def __init__(self, cache: MutableMapping[str, Any]):
         self.cache = cache
 
-    def append(
+    @property
+    def capacity(self) -> int:
+        return self.cache["k"].shape[1]
+
+    @property
+    def global_end(self) -> int:
+        return self.cache["global_end_index"].item()
+
+    @property
+    def local_end(self) -> int:
+        return self.cache["local_end_index"].item()
+
+    def move_left(
         self,
+        *,
+        preserved_prefix: int,
+        evicted_tokens: int,
+        moved_tokens: int,
+    ) -> None:
+        """Move a cache region left; the caller owns the eviction policy."""
+
+        source_start = preserved_prefix + evicted_tokens
+        source_end = source_start + moved_tokens
+        destination_end = preserved_prefix + moved_tokens
+        self.cache["k"][:, preserved_prefix:destination_end] = (
+            self.cache["k"][:, source_start:source_end].clone()
+        )
+        self.cache["v"][:, preserved_prefix:destination_end] = (
+            self.cache["v"][:, source_start:source_end].clone()
+        )
+
+    def write(
+        self,
+        start: int,
         key: torch.Tensor,
         value: torch.Tensor,
-        *,
-        current_start: int,
-        local_attn_size: int,
-        sink_tokens: int,
-    ) -> KVUpdate:
-        current_end = current_start + key.shape[1]
-        global_end = self.cache["global_end_index"].item()
-        local_end = self.cache["local_end_index"].item()
-        cache_size = self.cache["k"].shape[1]
-        num_new_tokens = key.shape[1]
+    ) -> None:
+        end = start + key.shape[1]
+        if start < 0 or end > self.capacity:
+            raise RuntimeError(
+                f"KV write [{start}:{end}] exceeds cache capacity {self.capacity}"
+            )
+        self.cache["k"][:, start:end] = key
+        self.cache["v"][:, start:end] = value
 
-        should_roll = (
-            local_attn_size != -1
-            and current_end > global_end
-            and num_new_tokens + local_end > cache_size
+    def read(self, start: int, end: int) -> SelectedKV:
+        return SelectedKV(
+            self.cache["k"][:, start:end],
+            self.cache["v"][:, start:end],
         )
-        if should_roll:
-            num_evicted_tokens = num_new_tokens + local_end - cache_size
-            num_rolled_tokens = local_end - num_evicted_tokens - sink_tokens
-            self.cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = (
-                self.cache["k"][:,
-                                sink_tokens + num_evicted_tokens:
-                                sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-            )
-            self.cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = (
-                self.cache["v"][:,
-                                sink_tokens + num_evicted_tokens:
-                                sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-            )
-            next_local_end = (
-                local_end + current_end - global_end - num_evicted_tokens
-            )
-        else:
-            next_local_end = local_end + current_end - global_end
 
-        local_start = next_local_end - num_new_tokens
-        self.cache["k"][:, local_start:next_local_end] = key
-        self.cache["v"][:, local_start:next_local_end] = value
-        return KVUpdate(current_end, local_start, next_local_end)
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> SelectedKV:
+        selected = [self.read(start, end) for start, end in ranges]
+        if len(selected) == 1:
+            return selected[0]
+        return SelectedKV(
+            torch.cat([item.key for item in selected], dim=1),
+            torch.cat([item.value for item in selected], dim=1),
+        )
 
     def commit(self, update: KVUpdate) -> None:
         """Commit indices after the attention operation has succeeded."""
@@ -96,17 +112,44 @@ class HistorySelector(ABC):
         *,
         local_end: int,
         frame_seqlen: int,
-        sink_size: int,
     ) -> SelectedKV:
         """Select an ordered logical view without mutating the KV store."""
 
 
-class SinkRecentHistorySelector(HistorySelector):
-    """Official LiveEdit policy: persistent sink plus newest recent frames."""
+class HistoryPolicy(HistorySelector):
+    """Interface that owns cache update and historical-KV selection decisions."""
 
-    def __init__(self, local_attn_size: int, max_attention_size: int):
-        self.local_attn_size = local_attn_size
-        self.max_attention_size = max_attention_size
+    @abstractmethod
+    def update(
+        self,
+        store: KVStore,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        current_start: int,
+        frame_seqlen: int,
+    ) -> KVUpdate:
+        """Apply the policy's cache update and return the resulting indices."""
+
+
+class NoMemoryManagementPolicy(HistoryPolicy):
+    """Baseline: append in order and expose all history without eviction."""
+
+    def update(
+        self,
+        store: KVStore,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        current_start: int,
+        frame_seqlen: int,
+    ) -> KVUpdate:
+        del frame_seqlen
+        current_end = current_start + key.shape[1]
+        local_end = store.local_end + current_end - store.global_end
+        local_start = local_end - key.shape[1]
+        store.write(local_start, key, value)
+        return KVUpdate(current_end, local_start, local_end)
 
     def select(
         self,
@@ -114,39 +157,88 @@ class SinkRecentHistorySelector(HistorySelector):
         *,
         local_end: int,
         frame_seqlen: int,
-        sink_size: int,
     ) -> SelectedKV:
-        cache = store.cache
+        del frame_seqlen
+        return store.read(0, local_end)
+
+
+class SinkRecentHistoryPolicy(HistoryPolicy):
+    """Official LiveEdit policy: rolling cache, sink, and recent history."""
+
+    def __init__(
+        self,
+        local_attn_size: int,
+        max_attention_size: int,
+        sink_size: int,
+    ):
+        self.local_attn_size = local_attn_size
+        self.max_attention_size = max_attention_size
+        self.sink_size = sink_size
+
+    def update(
+        self,
+        store: KVStore,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        current_start: int,
+        frame_seqlen: int,
+    ) -> KVUpdate:
+        current_end = current_start + key.shape[1]
+        num_new_tokens = key.shape[1]
+        sink_tokens = self.sink_size * frame_seqlen
+        should_roll = (
+            self.local_attn_size != -1
+            and current_end > store.global_end
+            and num_new_tokens + store.local_end > store.capacity
+        )
+        if should_roll:
+            num_evicted_tokens = (
+                num_new_tokens + store.local_end - store.capacity
+            )
+            num_rolled_tokens = (
+                store.local_end - num_evicted_tokens - sink_tokens
+            )
+            store.move_left(
+                preserved_prefix=sink_tokens,
+                evicted_tokens=num_evicted_tokens,
+                moved_tokens=num_rolled_tokens,
+            )
+            local_end = (
+                store.local_end
+                + current_end
+                - store.global_end
+                - num_evicted_tokens
+            )
+        else:
+            local_end = store.local_end + current_end - store.global_end
+
+        local_start = local_end - num_new_tokens
+        store.write(local_start, key, value)
+        return KVUpdate(current_end, local_start, local_end)
+
+    def select(
+        self,
+        store: KVStore,
+        *,
+        local_end: int,
+        frame_seqlen: int,
+    ) -> SelectedKV:
         if self.local_attn_size == -1:
             attention_start = max(0, local_end - self.max_attention_size)
-            return SelectedKV(
-                cache["k"][:, attention_start:local_end],
-                cache["v"][:, attention_start:local_end],
-            )
+            return store.read(attention_start, local_end)
 
         logical_cache_tokens = self.local_attn_size * frame_seqlen
-        sink_tokens = sink_size * frame_seqlen
+        sink_tokens = self.sink_size * frame_seqlen
         recent_tokens = logical_cache_tokens - sink_tokens
         if local_end <= logical_cache_tokens:
-            return SelectedKV(
-                cache["k"][:, :local_end],
-                cache["v"][:, :local_end],
-            )
+            return store.read(0, local_end)
         if sink_tokens == 0:
-            return SelectedKV(
-                cache["k"][:, local_end - recent_tokens:local_end],
-                cache["v"][:, local_end - recent_tokens:local_end],
-            )
-        return SelectedKV(
-            torch.cat([
-                cache["k"][:, :sink_tokens],
-                cache["k"][:, local_end - recent_tokens:local_end],
-            ], dim=1),
-            torch.cat([
-                cache["v"][:, :sink_tokens],
-                cache["v"][:, local_end - recent_tokens:local_end],
-            ], dim=1),
-        )
+            return store.read(local_end - recent_tokens, local_end)
+        return store.read_ranges([
+            (0, sink_tokens),
+            (local_end - recent_tokens, local_end),
+        ])
 
 
 class PositionMapper:

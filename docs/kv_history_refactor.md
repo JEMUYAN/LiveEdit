@@ -42,16 +42,38 @@ only gives that dictionary a small adapter (`KVStore`).
 
 ### `KVStore`
 
-Owns physical cache mutation only: decide whether this is a new global append,
-roll non-sink tokens when capacity would be exceeded, preserve the sink, write
-current K/V, and commit global/local end indices after attention succeeds. It
-does not decide which stored tokens are visible to attention.
+Provides policy-free physical storage primitives only: read ranges, write a
+range, move a range left, expose capacity/current indices, and commit updated
+indices after attention succeeds. It does not decide whether to evict, which
+prefix to preserve, where new KV belongs, or which tokens are visible.
 
-### `HistorySelector` and `SinkRecentHistorySelector`
+### `HistorySelector` and `HistoryPolicy`
 
-`HistorySelector` defines the parameter-free selection interface. The only
-phase-one implementation, `SinkRecentHistorySelector`, returns the official
-logical KV view. For a bounded window of `W` frames and a sink of `S` frames:
+`HistorySelector` defines the ordered-view interface. `HistoryPolicy` extends
+it with the cache-update decision. A policy therefore owns both halves of
+memory management: how history is retained and which retained history is used.
+
+### `NoMemoryManagementPolicy`
+
+This is the baseline implementation used to validate the abstraction itself.
+It writes each new chunk sequentially and exposes the entire initialized prefix.
+It does not roll, evict, preserve a sink, or truncate/select recent history. If
+the preallocated cache is too small, it raises an explicit capacity error rather
+than silently applying a memory policy.
+
+### `SinkRecentHistoryPolicy`
+
+This is the author's original LiveEdit behavior, moved behind `HistoryPolicy`.
+It owns all of the following:
+
+1. detecting a new global append;
+2. deciding when the physical cache must roll;
+3. preserving the first `S` sink frames;
+4. evicting the oldest non-sink tokens;
+5. writing the new chunk at the resulting local position; and
+6. selecting the ordered logical view used by attention.
+
+For a bounded window of `W` frames and a sink of `S` frames:
 
 ```text
 visible = first S frames + newest (W - S) frames
@@ -72,6 +94,12 @@ Keeps position semantics separate from storage/selection:
 - pruned KV remains unsupported with window-relative RoPE, matching baseline.
 
 The mapper owns no tensors, parameters, or persistent state.
+
+`CausalWanSelfAttention` binds `SinkRecentHistoryPolicy` by default, so official
+inference behavior stays unchanged. The bound object is a plain Python object,
+not an `nn.Module`; it adds no checkpoint keys or learned parameters. A caller
+can replace `history_policy` with `NoMemoryManagementPolicy` for a full-history
+baseline when the allocated cache is large enough.
 
 ## Compatibility invariants
 
@@ -97,13 +125,14 @@ git switch refactor/kv-history-selection
 python tests/test_kv_history_equivalence.py -v
 ```
 
-The test uses a fixed seed and compares a frozen copy of the original algorithm
-with the refactored components after every chunk. It covers cache growth,
-rolling, sink retention, no-sink selection, unbounded selection, absolute RoPE,
-window-relative RoPE, and final scaled-dot-product attention. Expected result:
-exact equality for cache/index tensors and zero numerical difference for the
-component-level output, since both paths execute the same operations in the
-same order.
+The test uses a fixed seed and compares a frozen copy of the original inline
+algorithm with `SinkRecentHistoryPolicy` after every chunk. It covers cache
+growth, rolling, sink retention, no-sink selection, unbounded selection,
+absolute RoPE, window-relative RoPE, and final scaled-dot-product attention. It
+also verifies that `NoMemoryManagementPolicy` appends/exposes all history and
+raises on capacity exhaustion instead of evicting. Expected result: exact
+equality for cache/index tensors and zero numerical difference for the official
+policy path, since both paths execute the same operations in the same order.
 
 Then run one existing short inference command twice from the same checkpoint
 and seed: once at the baseline commit and once on this branch. Save the latent

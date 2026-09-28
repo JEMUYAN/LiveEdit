@@ -11,8 +11,9 @@ import torch
 
 from wan.modules.kv_memory import (
     KVStore,
+    NoMemoryManagementPolicy,
     PositionMapper,
-    SinkRecentHistorySelector,
+    SinkRecentHistoryPolicy,
 )
 
 
@@ -194,20 +195,22 @@ def refactored_step(
         rope_apply_pruned=unused_pruned_rope,
     )
     store = KVStore(cache)
-    update = store.append(
+    policy = SinkRecentHistoryPolicy(
+        local_attn_size,
+        max_attention_size,
+        sink_size,
+    )
+    update = policy.update(
+        store,
         cache_key,
         value,
         current_start=current_start,
-        local_attn_size=local_attn_size,
-        sink_tokens=sink_size * frame_seqlen,
+        frame_seqlen=frame_seqlen,
     )
-    selected = SinkRecentHistorySelector(
-        local_attn_size, max_attention_size
-    ).select(
+    selected = policy.select(
         store,
         local_end=update.local_end,
         frame_seqlen=frame_seqlen,
-        sink_size=sink_size,
     )
     roped_query, attention_k = mapper.map_selected(
         query,
@@ -289,6 +292,60 @@ class KVHistoryEquivalenceTest(unittest.TestCase):
                 torch.testing.assert_close(
                     legacy_cache[name], refactored_cache[name], rtol=0, atol=0
                 )
+
+    def test_no_memory_management_baseline_appends_and_exposes_all_history(self):
+        cache = make_cache(capacity=8)
+        store = KVStore(cache)
+        policy = NoMemoryManagementPolicy()
+
+        first_key = torch.full((1, 4, 2, 4), 1.0)
+        first_value = torch.full((1, 4, 2, 4), 10.0)
+        first = policy.update(
+            store,
+            first_key,
+            first_value,
+            current_start=0,
+            frame_seqlen=2,
+        )
+        store.commit(first)
+
+        second_key = torch.full((1, 4, 2, 4), 2.0)
+        second_value = torch.full((1, 4, 2, 4), 20.0)
+        second = policy.update(
+            store,
+            second_key,
+            second_value,
+            current_start=4,
+            frame_seqlen=2,
+        )
+        selected = policy.select(
+            store,
+            local_end=second.local_end,
+            frame_seqlen=2,
+        )
+        store.commit(second)
+
+        torch.testing.assert_close(
+            selected.key,
+            torch.cat([first_key, second_key], dim=1),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            selected.value,
+            torch.cat([first_value, second_value], dim=1),
+            rtol=0,
+            atol=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds cache capacity"):
+            policy.update(
+                store,
+                torch.zeros(1, 2, 2, 4),
+                torch.zeros(1, 2, 2, 4),
+                current_start=8,
+                frame_seqlen=2,
+            )
 
 
 if __name__ == "__main__":

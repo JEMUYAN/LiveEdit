@@ -22,7 +22,7 @@ from utils.attention_mask import blockwise_causal_attention_mask
 from wan.modules.kv_memory import (
     KVStore,
     PositionMapper,
-    SinkRecentHistorySelector,
+    SinkRecentHistoryPolicy,
 )
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
@@ -150,6 +150,11 @@ class CausalWanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
+        self.history_policy = SinkRecentHistoryPolicy(
+            local_attn_size,
+            self.max_attention_size,
+            sink_size,
+        )
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -299,24 +304,18 @@ class CausalWanSelfAttention(nn.Module):
                 rope_apply_pruned=causal_rope_apply_pruned,
             )
 
-            sink_tokens = self.sink_size * frame_seqlen
             store = KVStore(kv_cache)
-            update = store.append(
+            update = self.history_policy.update(
+                store,
                 cache_key,
                 v,
                 current_start=current_start,
-                local_attn_size=self.local_attn_size,
-                sink_tokens=sink_tokens,
+                frame_seqlen=frame_seqlen,
             )
-            selector = SinkRecentHistorySelector(
-                self.local_attn_size,
-                self.max_attention_size,
-            )
-            selected = selector.select(
+            selected = self.history_policy.select(
                 store,
                 local_end=update.local_end,
                 frame_seqlen=frame_seqlen,
-                sink_size=self.sink_size,
             )
             roped_query, attention_k = position_mapper.map_selected(
                 q,
