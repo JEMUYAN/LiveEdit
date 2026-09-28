@@ -19,6 +19,11 @@ import torch.distributed as dist
 import os
 
 from utils.attention_mask import blockwise_causal_attention_mask
+from wan.modules.kv_memory import (
+    KVStore,
+    PositionMapper,
+    SinkRecentHistorySelector,
+)
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -280,132 +285,57 @@ class CausalWanSelfAttention(nn.Module):
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
             is_pruned = pruning_info and pruning_info.get('pruned', False)
-            if self.window_rope and is_pruned:
-                raise NotImplementedError(
-                    "window_rope is not compatible with pruned KV tokens yet"
-                )
+            position_mapper = PositionMapper(self.window_rope)
+            roped_query, cache_key = position_mapper.prepare_current(
+                q,
+                k,
+                v,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+                current_start_frame=current_start_frame,
+                is_pruned=is_pruned,
+                pruning_info=pruning_info,
+                rope_apply=causal_rope_apply,
+                rope_apply_pruned=causal_rope_apply_pruned,
+            )
 
-            # Absolute RoPE stores already-rotated K. Window RoPE instead stores
-            # raw K, because rolling changes its physical/window position and K
-            # must be rotated again in the new window coordinate system.
-            if not self.window_rope:
-                if is_pruned:
-                    roped_query = causal_rope_apply_pruned(
-                        q, grid_sizes, freqs, pruning_info,
-                        start_frame=current_start_frame
-                    ).type_as(v)
-                    cache_key = causal_rope_apply_pruned(
-                        k, grid_sizes, freqs, pruning_info,
-                        start_frame=current_start_frame
-                    ).type_as(v)
-                else:
-                    roped_query = causal_rope_apply(
-                        q, grid_sizes, freqs,
-                        start_frame=current_start_frame
-                    ).type_as(v)
-                    cache_key = causal_rope_apply(
-                        k, grid_sizes, freqs,
-                        start_frame=current_start_frame
-                    ).type_as(v)
-            else:
-                roped_query = None
-                cache_key = k
-
-            current_end = current_start + q.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = q.shape[1]
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                # Insert the new keys/values at the end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-                # if debug_dict["block_index"] == 0 :
-                #     print(f"[KVCache DEBUG] {local_start_index} to {local_end_index}, {sink_tokens=}")
-                #     print(f"[KVCache DEBUG] {roped_key.shape=}")
-                #     print(f"[KVCache DEBUG] {v.shape=}")
-                kv_cache["k"][:, local_start_index:local_end_index] = cache_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                local_start_index = local_end_index - num_new_tokens
-                # if debug_dict is not None and debug_dict["block_index"] == 0 :
-                #     print(f"[KVCache DEBUG] {local_start_index} to {local_end_index}, {sink_tokens=}")
-                #     print(f"[KVCache DEBUG] {roped_key.shape=}")
-                #     print(f"[KVCache DEBUG] {v.shape=}")
-                kv_cache["k"][:, local_start_index:local_end_index] = cache_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            # The physical training cache may be larger than the logical local
-            # attention window so gradient checkpointing can replay chunks in
-            # reverse. Select only the logical view here: persistent sink
-            # frames plus the most recent non-sink frames.
-            if self.local_attn_size == -1:
-                attention_start = max(0, local_end_index - self.max_attention_size)
-                attention_k = kv_cache["k"][:, attention_start:local_end_index]
-                attention_v = kv_cache["v"][:, attention_start:local_end_index]
-            else:
-                logical_cache_tokens = self.local_attn_size * frame_seqlen
-                recent_tokens = logical_cache_tokens - sink_tokens
-                if local_end_index <= logical_cache_tokens:
-                    attention_k = kv_cache["k"][:, :local_end_index]
-                    attention_v = kv_cache["v"][:, :local_end_index]
-                elif sink_tokens == 0:
-                    attention_k = kv_cache["k"][:, local_end_index - recent_tokens:local_end_index]
-                    attention_v = kv_cache["v"][:, local_end_index - recent_tokens:local_end_index]
-                else:
-                    attention_k = torch.cat([
-                        kv_cache["k"][:, :sink_tokens],
-                        kv_cache["k"][:, local_end_index - recent_tokens:local_end_index]
-                    ], dim=1)
-                    attention_v = torch.cat([
-                        kv_cache["v"][:, :sink_tokens],
-                        kv_cache["v"][:, local_end_index - recent_tokens:local_end_index]
-                    ], dim=1)
-
-            if self.window_rope:
-                if attention_k.shape[1] % frame_seqlen != 0:
-                    raise ValueError(
-                        "window_rope requires a whole number of frames in KV cache, "
-                        f"got {attention_k.shape[1]} tokens for frame_seqlen={frame_seqlen}"
-                    )
-                key_grid_sizes = grid_sizes.clone()
-                key_grid_sizes[:, 0] = attention_k.shape[1] // frame_seqlen
-                attention_k = causal_rope_apply(
-                    attention_k,
-                    key_grid_sizes,
-                    freqs,
-                    start_frame=0,
-                ).type_as(v)
-                query_window_start = (
-                    attention_k.shape[1] - q.shape[1]
-                ) // frame_seqlen
-                roped_query = causal_rope_apply(
-                    q,
-                    grid_sizes,
-                    freqs,
-                    start_frame=query_window_start,
-                ).type_as(v)
+            store = KVStore(kv_cache)
+            update = store.append(
+                cache_key,
+                v,
+                current_start=current_start,
+                local_attn_size=self.local_attn_size,
+                sink_tokens=sink_tokens,
+            )
+            selector = SinkRecentHistorySelector(
+                self.local_attn_size,
+                self.max_attention_size,
+            )
+            selected = selector.select(
+                store,
+                local_end=update.local_end,
+                frame_seqlen=frame_seqlen,
+                sink_size=self.sink_size,
+            )
+            roped_query, attention_k = position_mapper.map_selected(
+                q,
+                selected.key,
+                v,
+                roped_query,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+                frame_seqlen=frame_seqlen,
+                rope_apply=causal_rope_apply,
+            )
 
             x = attention( # 对应wan/modules/attention.py中的attention函数
                 roped_query,
                 attention_k,
-                attention_v,
+                selected.value,
                 debug_dict=debug_dict
             )
-            kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
+            store.commit(update)
 
         # output
         x = x.flatten(2)
