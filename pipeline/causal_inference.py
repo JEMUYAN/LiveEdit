@@ -599,7 +599,14 @@ class CausalInferencePipeline(torch.nn.Module):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
-        # Step 4: Decode the output
+        # Step 4: Decode the output. Diffusion weights and the KV cache are
+        # no longer needed, and keeping them on a 24GB GPU leaves too little
+        # room for the full-clip VAE decode.
+        self.kv_cache1 = None
+        self.crossattn_cache = None
+        self.generator.to("cpu")
+        self.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
         video = self.vae.decode_to_pixel(output, use_cache=False)
         if wo_scale:
             video = (video).clamp(0, 1)
