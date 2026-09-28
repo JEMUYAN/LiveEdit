@@ -4,17 +4,39 @@
 branch. It intentionally does not call the new classes.
 """
 
+import importlib.util
 import math
 import unittest
+from pathlib import Path
 
 import torch
 
-from wan.modules.kv_memory import (
-    KVStore,
-    NoMemoryManagementPolicy,
-    PositionMapper,
-    SinkRecentHistoryPolicy,
-)
+
+def _load_kv_memory():
+    """Load the policy module without importing the ``wan`` package.
+
+    ``python tests/test_kv_history_equivalence.py`` puts ``tests/`` on
+    ``sys.path``, not the repository root. Importing ``wan`` also executes
+    ``T5EncoderModel``'s default ``torch.cuda.current_device()``, which fails
+    when no GPU is visible. This test only needs the parameter-free KV module.
+    """
+
+    module_path = (
+        Path(__file__).resolve().parents[1] / "wan" / "modules" / "kv_memory.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "kv_memory_under_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_kv_memory = _load_kv_memory()
+KVStore = _kv_memory.KVStore
+NoMemoryManagementPolicy = _kv_memory.NoMemoryManagementPolicy
+PositionMapper = _kv_memory.PositionMapper
+SinkRecentHistoryPolicy = _kv_memory.SinkRecentHistoryPolicy
 
 
 def make_cache(capacity, heads=2, head_dim=4):

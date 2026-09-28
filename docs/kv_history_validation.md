@@ -54,12 +54,17 @@ full-history visibility, and an explicit error on capacity exhaustion.
 Record the result here after the server run:
 
 ```text
-Date:
-Server/GPU:
-PyTorch/CUDA:
-Command:
-Result:
+Date: 2026-09-28
+Server/GPU: existing liveedit env, CUDA_VISIBLE_DEVICES empty (CPU only)
+PyTorch/CUDA: torch 2.7.1+cu126, CUDA toolkit 12.6 in the wheel, no GPU initialized
+Command: python tests/test_kv_history_equivalence.py -v
+Result: PASS (2 tests, exact equality)
 Failure details (if any):
+  First run failed before any assertion. `python tests/...` does not put the
+  repo root on sys.path, and `import wan` evaluates
+  T5EncoderModel(device=torch.cuda.current_device()) at import time.
+  The test now loads wan/modules/kv_memory.py directly, so this check stays
+  CPU-only. It does not import the full model or touch a GPU.
 ```
 
 ## Full-model A/B record
