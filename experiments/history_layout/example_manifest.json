@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "output_root": "../../outputs/history-layout-example",
+  "baseline_variant": "official_sink3_recent6",
+  "dataset": [
+    {
+      "id": "black-coat",
+      "source_path": "../../test_cases/long_test.mp4",
+      "instruction": "Change the white coat to black.",
+      "scene_by_chunk": {
+        "0": "opening",
+        "1": "opening",
+        "2": "middle",
+        "3": "middle",
+        "4": "late",
+        "5": "late",
+        "6": "late"
+      }
+    }
+  ],
+  "seeds": [0, 1, 2],
+  "inference": {
+    "python": "python",
+    "config_path": "../../configs/wan_mm-ar-forcing-local.yaml",
+    "checkpoint_path": "../../checkpoints/liveedit/ar-forcing_002000.pt",
+    "num_output_frames": 21,
+    "inference_num_steps": 4,
+    "extra_args": {
+      "local_attn_size": 9,
+      "sink_size": 3,
+      "window_rope": true
+    }
+  },
+  "variants": [
+    {
+      "id": "official_sink3_recent6",
+      "policy": {"policy": "official_sink_recent"}
+    },
+    {
+      "id": "full_history",
+      "policy": {"policy": "no_memory_management", "cache_frames": 21}
+    },
+    {
+      "id": "non_contiguous_stride2",
+      "policy": {
+        "policy": "chunk_layout",
+        "cache_frames": 21,
+        "planner": {"type": "stride", "stride": 2, "recent_count": 1}
+      }
+    },
+    {
+      "id": "scene_contrast",
+      "policy": {
+        "policy": "chunk_layout",
+        "cache_frames": 21,
+        "planner": {
+          "type": "scene_contrast",
+          "contrast_count": 2,
+          "recent_count": 2
+        }
+      }
+    },
+    {
+      "id": "official_sink_sweep",
+      "policy": {"policy": "official_sink_recent"},
+      "sweep": {"inference_overrides.sink_size": [0, 1, 2, 4, 6]}
+    },
+    {
+      "id": "variable_anchor",
+      "policy": {
+        "policy": "chunk_layout",
+        "cache_frames": 21,
+        "planner": {
+          "type": "anchor_recent",
+          "anchors": [2],
+          "recent_count": 2,
+          "schedule": {
+            "4": [1],
+            "5": [2],
+            "6": [3]
+          }
+        }
+      }
+    }
+  ]
+}

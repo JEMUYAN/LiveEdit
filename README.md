@@ -157,6 +157,15 @@ CUDA_VISIBLE_DEVICES=0 python inference-mm.py \
 
 `--save_mask` saves visualizations of the reused and fully computed regions to the output folder.
 
+### Historical KV layout experiments
+
+The refactored KV interface includes an opt-in experiment harness for
+non-contiguous history, cross-scene combinations, sink-count sweeps, and
+non-initial/variable sink chunks. It does not change the default inference
+policy or add trainable parameters. See
+[`docs/history_layout_experiments.md`](docs/history_layout_experiments.md) for
+the manifest format, server runner, metrics, and paired result reports.
+
 ## ⚙️ Training
 
 LiveEdit uses a three-stage training pipeline:

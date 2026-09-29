@@ -68,6 +68,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+        self.kv_cache_frames_override = None
+        self.last_history_selection_trace = []
         
         self.use_internal_pruning = getattr(args, "use_internal_pruning", False)
         self.internal_pruning_layers = getattr(args, "internal_pruning_layers", ["self_attn", "ffn"])
@@ -391,6 +393,8 @@ class CausalInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+                self.kv_cache1[block_index]["history_chunks"] = []
+                self.kv_cache1[block_index]["history_selection_trace"] = []
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -602,6 +606,10 @@ class CausalInferencePipeline(torch.nn.Module):
         # Step 4: Decode the output. Diffusion weights and the KV cache are
         # no longer needed, and keeping them on a 24GB GPU leaves too little
         # room for the full-clip VAE decode.
+        if self.kv_cache1:
+            self.last_history_selection_trace = list(
+                self.kv_cache1[0].get("history_selection_trace", [])
+            )
         self.kv_cache1 = None
         self.crossattn_cache = None
         self.generator.to("cpu")
@@ -648,7 +656,13 @@ class CausalInferencePipeline(torch.nn.Module):
         Initialize a Per-GPU KV cache for the Wan model.
         """
         kv_cache1 = []
-        if self.local_attn_size != -1:
+        if self.kv_cache_frames_override is not None:
+            kv_cache_size = self.kv_cache_frames_override * self.frame_seq_length
+            print(
+                "[History Experiment] full cache allocation: "
+                f"{self.kv_cache_frames_override} frames"
+            )
+        elif self.local_attn_size != -1:
             # Use the local attention size to compute the KV cache size
             kv_cache_size = self.local_attn_size * self.frame_seq_length
             print(f"[DEBUG] {self.local_attn_size=} {self.frame_seq_length=}")
@@ -661,7 +675,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "history_chunks": [],
+                "history_selection_trace": [],
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache

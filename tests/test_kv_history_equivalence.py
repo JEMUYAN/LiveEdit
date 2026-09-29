@@ -34,9 +34,11 @@ def _load_kv_memory():
 
 _kv_memory = _load_kv_memory()
 KVStore = _kv_memory.KVStore
+ChunkLayoutHistoryPolicy = _kv_memory.ChunkLayoutHistoryPolicy
 NoMemoryManagementPolicy = _kv_memory.NoMemoryManagementPolicy
 PositionMapper = _kv_memory.PositionMapper
 SinkRecentHistoryPolicy = _kv_memory.SinkRecentHistoryPolicy
+build_history_layout_planner = _kv_memory.build_history_layout_planner
 
 
 def make_cache(capacity, heads=2, head_dim=4):
@@ -368,6 +370,47 @@ class KVHistoryEquivalenceTest(unittest.TestCase):
                 current_start=8,
                 frame_seqlen=2,
             )
+
+    def test_chunk_layout_selects_non_contiguous_ranges_and_traces_once(self):
+        cache = make_cache(capacity=12)
+        store = KVStore(cache)
+        planner = build_history_layout_planner({
+            "type": "explicit",
+            "schedule": {"2": [0, 2]},
+        })
+        policy = ChunkLayoutHistoryPolicy(planner)
+        values = []
+        for chunk_id, current_start in enumerate((0, 4, 8)):
+            key = torch.full((1, 4, 2, 4), float(chunk_id + 1))
+            value = torch.full((1, 4, 2, 4), float((chunk_id + 1) * 10))
+            update = policy.update(
+                store, key, value,
+                current_start=current_start, frame_seqlen=2,
+            )
+            selected = policy.select(
+                store, local_end=update.local_end, frame_seqlen=2,
+            )
+            store.commit(update)
+            values.append((key, value, selected))
+
+        torch.testing.assert_close(
+            values[-1][2].key,
+            torch.cat([values[0][0], values[2][0]], dim=1),
+            rtol=0, atol=0,
+        )
+        self.assertEqual(
+            cache["history_selection_trace"][-1]["selected_chunks"], [0, 2]
+        )
+
+        # A repeated diffusion step overwrites current KV but creates neither a
+        # duplicate chunk record nor a duplicate realized-layout trace.
+        repeated = policy.update(
+            store, values[-1][0], values[-1][1],
+            current_start=8, frame_seqlen=2,
+        )
+        policy.select(store, local_end=repeated.local_end, frame_seqlen=2)
+        self.assertEqual(len(cache["history_chunks"]), 3)
+        self.assertEqual(len(cache["history_selection_trace"]), 3)
 
 
 if __name__ == "__main__":

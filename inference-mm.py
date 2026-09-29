@@ -1,4 +1,5 @@
 import argparse
+import json
 import torch
 import os
 from omegaconf import OmegaConf
@@ -18,6 +19,11 @@ from pipeline import (
 from utils.dataset import TextDataset, TextImagePairDataset, TextVideoPairDataset
 from utils.misc import set_seed
 from wan.modules import TinyVAE
+from wan.modules.history_experiment import (
+    configure_history_policy,
+    load_history_policy_config,
+    required_cache_frames,
+)
 
 # from demo_utils.memory import device, get_cuda_free_memory_gb, DynamicSwapInstaller
 
@@ -82,6 +88,10 @@ parser.add_argument("--local_attn_size", type=int, default=-1, help="Local atten
 parser.add_argument("--sink_size", type=int, default=0, help="Sink size for causal attention")
 parser.add_argument("--window_rope", action="store_true",
                     help="Rebase Q/K RoPE positions to the current rolling KV window")
+parser.add_argument("--history_policy_config", type=str, default=None,
+                    help="JSON policy configuration for a history-layout experiment")
+parser.add_argument("--history_trace_path", type=str, default=None,
+                    help="Write the realized chunk selection trace as JSON")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -151,6 +161,15 @@ if args.checkpoint_path:
     generator_state_dict = select_generator_state_dict(state_dict, use_ema=args.use_ema)
     clean_state_dict = remove_fsdp_wrapped_module(generator_state_dict)
     pipeline.generator.load_state_dict(clean_state_dict)
+
+history_policy_config = None
+if args.history_policy_config:
+    history_policy_config = load_history_policy_config(args.history_policy_config)
+    configure_history_policy(pipeline.generator.model, history_policy_config)
+    pipeline.kv_cache_frames_override = required_cache_frames(
+        history_policy_config, args.num_output_frames
+    )
+    print(f"[History Experiment] policy={history_policy_config['policy']}")
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 # if low_memory:
@@ -339,6 +358,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         )
     # print(f"[DEBUG] {sampled_noise.shape=} {source_latent.shape=}")
     # Generate 81 frames
+    torch.cuda.reset_peak_memory_stats(device)
     result = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -352,12 +372,31 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
     
     # 解包返回值
+    generation_time = None
     if args.return_generation_time:
         video, latents, generation_time = result
         # 记录生成时间
         print(f"[Sample] Generation time: {generation_time:.2f}s")
     else:
         video, latents = result
+
+    if args.history_trace_path:
+        trace_path = os.path.abspath(args.history_trace_path)
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        with open(trace_path, "w", encoding="utf-8") as trace_file:
+            json.dump(
+                {
+                    "policy": history_policy_config,
+                    "selection_trace": pipeline.last_history_selection_trace,
+                    "runtime": {
+                        "generation_seconds": generation_time,
+                        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                        "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                    },
+                },
+                trace_file,
+                indent=2,
+            )
 
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)

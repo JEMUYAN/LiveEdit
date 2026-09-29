@@ -11,6 +11,28 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 import torch
 
+try:
+    from .history_layout import (
+        ChunkSpan,
+        HistoryLayoutPlanner,
+        build_history_layout_planner,
+    )
+except ImportError:  # Support the CPU test's direct file import.
+    import importlib.util
+    import pathlib
+    import sys
+
+    _layout_path = pathlib.Path(__file__).with_name("history_layout.py")
+    _layout_spec = importlib.util.spec_from_file_location(
+        "liveedit_history_layout", _layout_path
+    )
+    _layout_module = importlib.util.module_from_spec(_layout_spec)
+    sys.modules[_layout_spec.name] = _layout_module
+    _layout_spec.loader.exec_module(_layout_module)
+    ChunkSpan = _layout_module.ChunkSpan
+    HistoryLayoutPlanner = _layout_module.HistoryLayoutPlanner
+    build_history_layout_planner = _layout_module.build_history_layout_planner
+
 
 @dataclass(frozen=True)
 class KVUpdate:
@@ -239,6 +261,81 @@ class SinkRecentHistoryPolicy(HistoryPolicy):
             (0, sink_tokens),
             (local_end - recent_tokens, local_end),
         ])
+
+
+class ChunkLayoutHistoryPolicy(HistoryPolicy):
+    """Append-only experimental store with pluggable chunk selection.
+
+    Unlike the official rolling policy this policy intentionally retains the
+    full stream.  That is required to compare arbitrary, non-contiguous layouts
+    without conflating selection with eviction.  The pipeline must therefore
+    allocate enough physical cache for the full experiment clip.
+    """
+
+    def __init__(self, planner: HistoryLayoutPlanner):
+        self.planner = planner
+
+    def update(
+        self,
+        store: KVStore,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        current_start: int,
+        frame_seqlen: int,
+    ) -> KVUpdate:
+        if key.shape[1] % frame_seqlen != 0:
+            raise ValueError(
+                "chunk layout experiments require whole latent frames, got "
+                f"{key.shape[1]} tokens for frame_seqlen={frame_seqlen}"
+            )
+        previous_global_end = store.global_end
+        current_end = current_start + key.shape[1]
+        # Append-only storage keeps physical and global token coordinates equal.
+        store.write(current_start, key, value)
+        if current_end > previous_global_end:
+            records = store.cache.setdefault("history_chunks", [])
+            records.append(
+                ChunkSpan(
+                    chunk_id=len(records),
+                    frame_start=current_start // frame_seqlen,
+                    frame_count=key.shape[1] // frame_seqlen,
+                    token_start=current_start,
+                    token_count=key.shape[1],
+                )
+            )
+        return KVUpdate(current_end, current_start, current_end)
+
+    def select(
+        self,
+        store: KVStore,
+        *,
+        local_end: int,
+        frame_seqlen: int,
+    ) -> SelectedKV:
+        del local_end, frame_seqlen
+        records = store.cache.get("history_chunks", [])
+        selected_ids = self.planner.select(records)
+        by_id = {record.chunk_id: record for record in records}
+        ranges = [
+            (
+                by_id[chunk_id].token_start,
+                by_id[chunk_id].token_start + by_id[chunk_id].token_count,
+            )
+            for chunk_id in selected_ids
+        ]
+        if not ranges:
+            raise RuntimeError("history layout planner selected no current chunk")
+        trace = store.cache.setdefault("history_selection_trace", [])
+        current = records[-1]
+        entry = {
+            "current_chunk": current.chunk_id,
+            "current_frame_start": current.frame_start,
+            "selected_chunks": selected_ids,
+        }
+        if not trace or trace[-1] != entry:
+            trace.append(entry)
+        return store.read_ranges(ranges)
 
 
 class PositionMapper:
